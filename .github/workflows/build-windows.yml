@@ -1,0 +1,72 @@
+name: Build Windows installer
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      VLC_VERSION: "3.0.21"
+      QT_VERSION: "6.7.3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2019_64
+          cache: true
+
+      - name: Download VLC (runtime + SDK)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://get.videolan.org/vlc/$env:VLC_VERSION/win64/vlc-$env:VLC_VERSION-win64.zip" -OutFile vlc.zip
+          Expand-Archive vlc.zip -DestinationPath vlc
+          Get-ChildItem vlc
+
+      - name: Configure + build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DVLC_SDK_DIR=$PWD/vlc/vlc-$env:VLC_VERSION"
+          cmake --build build
+
+      - name: Collect + deploy Qt (windeployqt)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item build/0xcl.exe dist/
+          Copy-Item "vlc/vlc-$env:VLC_VERSION/libvlc.dll","vlc/vlc-$env:VLC_VERSION/libvlccore.dll" dist/
+          Copy-Item "vlc/vlc-$env:VLC_VERSION/plugins" dist/plugins -Recurse
+          windeployqt --release --no-translations --qmldir qml dist/0xcl.exe
+          Get-ChildItem dist | Select-Object -First 40
+
+      - name: Smoke test (starts, then closed after 8s)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/0xcl.exe -PassThru
+          Start-Sleep 8
+          if ($p.HasExited) { throw "0xcl.exe exited early with code $($p.ExitCode)" }
+          Stop-Process $p
+
+      - name: Setup .exe (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\0xcl.iss
+
+      - name: MSI (WiX v4)
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix
+          wix build packaging\Package.wxs -d DistDir=dist -arch x64 -o installer\0xcl-modern-vlc.msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 0xcl-windows
+          path: |
+            installer/*.exe
+            installer/*.msi
