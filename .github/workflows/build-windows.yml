@@ -1,3 +1,25 @@
+name: Build Windows installer
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      QT_VERSION: "6.7.3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2019_64
+          cache: true
+
       - name: Download VLC (runtime + SDK)
         shell: pwsh
         run: |
@@ -9,15 +31,62 @@
               Write-Host "Trying $url"
               try {
                 Invoke-WebRequest $url -OutFile vlc.zip -UserAgent "Mozilla/5.0" -MaximumRedirection 10
-                if ((Get-Item vlc.zip).Length -gt 20MB) {
-                  $ok = $true
-                  "VLC_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-                  break
-                }
+                if ((Get-Item vlc.zip).Length -gt 20MB) { $ok = $true; break }
               } catch { Write-Host "Failed: $($_.Exception.Message)" }
             }
             if ($ok) { break }
           }
           if (-not $ok) { throw "Could not download VLC from any mirror" }
           Expand-Archive vlc.zip -DestinationPath vlc
-          Get-ChildItem vlc
+          $dir = (Get-ChildItem vlc -Directory | Select-Object -First 1).FullName -replace '\\','/'
+          "VLC_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "VLC folder: $dir"
+          Get-ChildItem "$dir/sdk/lib"
+
+      - name: Configure + build
+        shell: pwsh
+        run: |
+          $qt = $env:QT_ROOT_DIR -replace '\\','/'
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DVLC_SDK_DIR=$env:VLC_DIR" "-DCMAKE_PREFIX_PATH=$qt"
+          cmake --build build
+
+      - name: Collect + deploy Qt (windeployqt)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item build/0xcl.exe dist/
+          Copy-Item "$env:VLC_DIR/libvlc.dll","$env:VLC_DIR/libvlccore.dll" dist/
+          Copy-Item "$env:VLC_DIR/plugins" dist/plugins -Recurse
+          windeployqt --release --no-translations --qmldir qml dist/0xcl.exe
+          Get-ChildItem dist | Select-Object -First 40
+
+      - name: Smoke test (start, close after 8s)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/0xcl.exe -PassThru
+          Start-Sleep 8
+          if ($p.HasExited) { throw "0xcl.exe exited early with code $($p.ExitCode)" }
+          Stop-Process $p
+
+      - name: Setup .exe (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\0xcl.iss
+
+      - name: MSI (WiX v4)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          wix build packaging\Package.wxs -d DistDir=dist -arch x64 -o installer\0xcl-modern-vlc.msi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: 0xcl-windows
+          if-no-files-found: warn
+          path: |
+            installer/*.exe
+            installer/*.msi
